@@ -17,23 +17,18 @@ import javax.swing.border.*;
 import javax.swing.table.*;
 
 /**
- * ANT MEENTO GUI v4.0
+ * ANT MEENTO GUI v4.2
  * P2P File Sharing · PKI Identity · Blockchain Ledger · DHT Bootstrap · HTTP Direct Download
  *
- * NEW IN v4:
- *  DHT Bootstrap — on launch, pulls peer lists from public bootstrap URLs and
- *    merges them into servers.txt (deduplication, threaded, non-blocking).
- *  HTTP/HTTPS Direct Download — if a line in servers.txt (or any loaded peer
- *    list) matches a URL that ends with a known file extension (jpg, jpeg, png,
- *    gif, mp4, mp3, pdf, zip, tar, gz, rar, 7z, mkv, avi, mov, webm, doc,
- *    docx, xls, xlsx, txt, csv, json, xml, exe, apk, iso, bin, torrent, …)
- *    it is treated as a direct HTTP file URL:
- *      • SYNC ALL  downloads it silently (no blockchain block, no notification)
- *      • SEARCH    matches the URL against the keyword and shows it in results
- *    When the port IS explicitly the P2P port (52525 or any custom port in the
- *    URL) the normal P2P flow is used instead.
- *  HTTP URLs without P2P port get no blockchain record and no peer notification.
- *  Plain host:port entries continue to work as before (P2P + blockchain).
+ * NEW IN v4.2:
+ *  UPnP / NAT-PMP — at startup (and on every port change), performs a full
+ *    SSDP multicast discovery, fetches the IGD device description XML, and
+ *    issues a SOAP AddPortMapping + GetExternalIPAddress request — all in a
+ *    background thread using only java.net.  On success the port badge shows
+ *    the external WAN IP.  On failure the app continues normally (manual
+ *    forwarding still works).  Pure Java, zero external libraries.
+ *  IPv6 — parseHostPort now correctly handles [::1]:52525 bracket notation.
+ *    isValidEntry accepts [hex:addr] and [hex:addr]:port entries.
  */
 public class AntMeentoGui {
 
@@ -112,6 +107,11 @@ public class AntMeentoGui {
     private volatile ServerSocket serverSock  = null;
     private volatile boolean      receiveMode = true;
     private final ExecutorService pool        = Executors.newCachedThreadPool();
+
+    // -- UPnP state ------------------------------------------------------------
+    private volatile String  upnpExternalIp   = null;  // external IP reported by IGD
+    private volatile boolean upnpMapped       = false; // true if port mapping succeeded
+    private volatile String  upnpIgdUrl       = null;  // control URL of discovered IGD
 
     // -- DHT state -------------------------------------------------------------
     /** All entries loaded from local servers.txt + DHT bootstrap, runtime only */
@@ -200,6 +200,8 @@ public class AntMeentoGui {
         buildUI();
         frame.setVisible(true);
         startServer();
+        // UPnP / NAT-PMP hole punching — run in background, non-blocking
+        pool.submit(new Runnable(){public void run(){doUPnP();}});
         // Load local servers into DHT runtime set
         dhtEntries.addAll(loadServers());
         // Bootstrap DHT in background — non-blocking
@@ -244,6 +246,7 @@ public class AntMeentoGui {
         Set<String> existingLocal = loadServers();
         int added = 0;
         for(String entry : discovered){
+            if(!isValidEntry(entry)) continue; // skip malformed lines from bootstrap sources
             dhtEntries.add(entry);
             // Only persist plain p2p peers (no file extension at end) to servers.txt
             if(!isHttpFileUrl(entry) && !existingLocal.contains(entry)){
@@ -388,16 +391,111 @@ public class AntMeentoGui {
         return parseHostPort(entry);
     }
 
+    /**
+     * Parse a raw host[:port] entry into [host, port].
+     * Handles four formats:
+     *   IPv6 with port   — [::1]:52525   ? ["::1",  "52525"]
+     *   IPv6 bare        — [::1]         ? ["::1",  "52525"]
+     *   IPv4/hostname    — host.com:1234 ? ["host.com", "1234"]
+     *   bare hostname    — host.com      ? ["host.com", "52525"]
+     */
     private String[] parseHostPort(String raw){
         try{
             String s = raw.trim();
+            // IPv6 address in brackets: [addr] or [addr]:port
+            if(s.startsWith("[")){
+                int closeBracket = s.indexOf(']');
+                if(closeBracket < 0) return null; // malformed
+                String host = s.substring(1, closeBracket);  // strip [ ]
+                if(closeBracket + 1 < s.length() && s.charAt(closeBracket+1) == ':'){
+                    String portStr = s.substring(closeBracket+2);
+                    return new String[]{host, portStr};
+                }
+                return new String[]{host, String.valueOf(DEFAULT_PORT)};
+            }
+            // IPv4 or hostname with optional port — use last colon as separator
             if(s.contains(":")){
-                String h = s.substring(0,s.lastIndexOf(':'));
+                String h = s.substring(0, s.lastIndexOf(':'));
                 String p = s.substring(s.lastIndexOf(':')+1);
                 return new String[]{h, p};
             }
             return new String[]{s, String.valueOf(DEFAULT_PORT)};
         }catch(Exception e){ log("Bad entry: "+raw, C_ERR); return null; }
+    }
+
+    /**
+     * Validate a server entry before insertion.
+     * Accepts:
+     *   - http:// or https:// URLs (basic URL syntax check)
+     *   - IPv4 addresses (with optional :port)
+     *   - Hostnames composed only of alphanumerics, dots, hyphens (with optional :port)
+     * Rejects anything containing whitespace, HTML tags, angle brackets, or
+     * entries that are clearly just plain prose (no dot, no colon, no slash).
+     */
+    private boolean isValidEntry(String raw){
+        if(raw == null) return false;
+        String s = raw.trim();
+        if(s.isEmpty()) return false;
+        // Reject if contains HTML / angle brackets / obvious bad chars
+        if(s.contains("<") || s.contains(">") || s.contains("\"") || s.contains("'")
+                || s.contains(" ") || s.contains("\t")) return false;
+        // Accept http/https URLs — validate with java.net.URL
+        if(s.toLowerCase().startsWith("http://") || s.toLowerCase().startsWith("https://")){
+            try{
+                URL u = new URL(s);
+                String host = u.getHost();
+                // Host must be non-empty and contain at least one dot or be localhost/IP
+                if(host == null || host.isEmpty()) return false;
+                if(!host.contains(".") && !host.equalsIgnoreCase("localhost")) return false;
+                // Host must not contain forbidden chars
+                if(host.matches(".*[<>\\s\"'].*")) return false;
+                return true;
+            }catch(Exception e){ return false; }
+        }
+        // Accept host:port or bare hostname/IP
+        // Must match: (letters/digits/dots/hyphens/brackets for IPv6) with optional :port
+        String hostPart = s.contains(":") ? s.substring(0, s.lastIndexOf(':')) : s;
+        String portPart = s.contains(":") ? s.substring(s.lastIndexOf(':')+1) : null;
+        // IPv6 bracket form [addr] or [addr]:port
+        if(s.startsWith("[")){
+            int cb = s.indexOf(']');
+            if(cb < 0) return false;
+            String addr = s.substring(1, cb);
+            if(addr.isEmpty()) return false;
+            if(!addr.matches("[0-9a-fA-F:]+")) return false; // must be hex digits and colons
+            if(cb+1 < s.length()){
+                if(s.charAt(cb+1) != ':') return false;
+                try{ int p=Integer.parseInt(s.substring(cb+2)); if(p<1||p>65535) return false; }
+                catch(NumberFormatException e){ return false; }
+            }
+            return true;
+        }
+        // hostPart must look like a hostname or IP (has a dot, or is pure digits separated by dots)
+        if(!hostPart.matches("[a-zA-Z0-9.\\-\\[\\]:]+")) return false;
+        // Must contain a dot (to distinguish from bare keywords like "hello")
+        if(!hostPart.contains(".") && !hostPart.equalsIgnoreCase("localhost")) return false;
+        // portPart if present must be a valid number
+        if(portPart != null){
+            try{ int p=Integer.parseInt(portPart); if(p<1||p>65535) return false; }
+            catch(NumberFormatException e){ return false; }
+        }
+        return true;
+    }
+
+    /**
+     * Returns true if this server entry should receive an HTTP GET ?info= notification
+     * after a successful P2P transfer.  Qualifies when the URL ends with .php
+     * or when its path ends with /info (with or without trailing slash).
+     */
+    private boolean isInfoNotifyUrl(String entry){
+        if(entry == null) return false;
+        String lo = entry.toLowerCase().trim();
+        if(!lo.startsWith("http")) return false;
+        try{
+            String path = new URL(entry).getPath();
+            String lp = path.toLowerCase();
+            return lp.endsWith(".php") || lp.endsWith("/info") || lp.equals("/info");
+        }catch(Exception e){ return false; }
     }
 
     private void setDhtStatus(final String msg){
@@ -653,6 +751,8 @@ public class AntMeentoGui {
         try{if(serverSock!=null&&!serverSock.isClosed())serverSock.close();}catch(IOException ig){}
         SwingUtilities.invokeLater(new Runnable(){public void run(){portLabel.setText("\u25CF  ...");portLabel.setForeground(C_WARN);}});
         startServer();
+        // Re-map the new port via UPnP
+        pool.submit(new Runnable(){public void run(){doUPnP();}});
     }
     private void handleIncoming(Socket sock){
         String peer=sock.getRemoteSocketAddress().toString();
@@ -715,6 +815,7 @@ public class AntMeentoGui {
             log("Downloaded: "+name+" ("+humanSize(len)+")",C_OK);
             final File df=dest; final String rh=host; final int rport=rp;
             pool.submit(new Runnable(){public void run(){String sp=fetchRemotePubKey(rh,rport);createAndPublishBlock(df,sp,"");refreshFiles();}});
+            notifyInfoEndpoints(dest, host);
         }catch(Exception e){log("Error downloading '"+name+"': "+e.getMessage(),C_ERR);new File(DOWNLOAD_DIR,name).delete();}
     }
     private void pushFile(String host, int rp, String name){
@@ -744,6 +845,59 @@ public class AntMeentoGui {
         return r;
     }
 
+    /**
+     * After a successful P2P transfer, notify all servers whose URL ends with
+     * ".php" or "/info" by sending an HTTP GET request with an "info" query
+     * parameter containing JSON-encoded transfer metadata.
+     * HTTP file entries (those without a P2P port) are intentionally excluded.
+     */
+    private void notifyInfoEndpoints(final File file, final String senderHost){
+        pool.submit(new Runnable(){public void run(){
+            Set<String> all = new LinkedHashSet<String>(loadServers());
+            all.addAll(dhtEntries);
+            for(String entry : all){
+                if(!isInfoNotifyUrl(entry)) continue;
+                try{
+                    String sha = "";
+                    try{sha = sha256file(file);}catch(Exception ig){}
+                    // Fetch the public key of the peer we downloaded from
+                    String serverPubKey = "";
+                    try{
+                        String[] hp = parseHostPort(senderHost);
+                        if(hp != null){
+                            String fetched = fetchRemotePubKey(hp[0], Integer.parseInt(hp[1]));
+                            if(fetched != null) serverPubKey = fetched;
+                        }
+                    }catch(Exception ig){}
+                    // Build JSON info payload (URL-encoded)
+                    String json = "{"
+                        +"\"filename\":\""+file.getName()+"\","
+                        +"\"filesize\":"+file.length()+","
+                        +"\"sha256\":\""+sha+"\","
+                        +"\"senderPubKey\":\""+myPublicKeyB64+"\","
+                        +"\"serverPubKey\":\""+serverPubKey+"\","
+                        +"\"receiver\":\""+myFingerprint+"\","
+                        +"\"timestamp\":"+System.currentTimeMillis()
+                        +"}";
+                    String encoded = URLEncoder.encode(json, "UTF-8");
+                    // Append ?info=... to the base URL
+                    String base = entry.contains("?") ? entry+"&info="+encoded : entry+"?info="+encoded;
+                    URL url = new URL(base);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(8000);
+                    conn.setRequestMethod("GET");
+                    conn.setRequestProperty("User-Agent","AntMeento/4.0");
+                    int code = conn.getResponseCode();
+                    conn.disconnect();
+                    log("Info notify ["+entry+"]: HTTP "+code, code>=200&&code<300 ? C_MUTED : C_WARN);
+                }catch(Exception e){
+                    log("Info notify failed ["+entry+"]: "+e.getMessage(), C_MUTED);
+                }
+            }
+        }});
+    }
+
     // -------------------------------------------------------------------------
     //  SEARCH — searches P2P peers AND http file entries
     // -------------------------------------------------------------------------
@@ -767,11 +921,14 @@ public class AntMeentoGui {
                 // -- HTTP file URL ------------------------------------------
                 if(isHttpFileUrl(entry) && !isHttpWithP2PPort(entry)){
                     String fname = extractFilenameFromUrl(entry);
-                    if(fname != null && !fname.isEmpty() && fname.toLowerCase().contains(q)){
-                        final boolean have = new File(DOWNLOAD_DIR, sanitize(fname)).exists();
-                        final String fn = fname;
+                    // Match on filename OR on the full URL string
+                    boolean fnMatch  = fname != null && !fname.isEmpty() && fname.toLowerCase().contains(q);
+                    boolean urlMatch = entry.toLowerCase().contains(q);
+                    if(fnMatch || urlMatch){
+                        final String displayName = (fname != null && !fname.isEmpty()) ? fname : entry;
+                        final boolean have = new File(DOWNLOAD_DIR, sanitize(displayName)).exists();
+                        final String fn = displayName;
                         SwingUtilities.invokeLater(new Runnable(){public void run(){
-                            // type="http" stored in data[4]
                             searchResultData.add(new String[]{fn, entry, entry, "", "http"});
                             searchModel.addRow(new Object[]{
                                 "  "+fn, "  \uD83C\uDF10 "+entry, have?"Already have":"HTTP"});
@@ -788,9 +945,13 @@ public class AntMeentoGui {
                             // Sub-entry could be another http file url
                             if(isHttpFileUrl(line) && !isHttpWithP2PPort(line)){
                                 String fn=extractFilenameFromUrl(line);
-                                if(fn!=null&&!fn.isEmpty()&&fn.toLowerCase().contains(q)){
-                                    final boolean have=new File(DOWNLOAD_DIR,sanitize(fn)).exists();
-                                    final String ffn=fn; final String fline=line;
+                                // Match on filename OR full URL
+                                boolean fnM  = fn!=null&&!fn.isEmpty()&&fn.toLowerCase().contains(q);
+                                boolean urlM = line.toLowerCase().contains(q);
+                                if(fnM || urlM){
+                                    final String dispName = (fn!=null&&!fn.isEmpty()) ? fn : line;
+                                    final boolean have=new File(DOWNLOAD_DIR,sanitize(dispName)).exists();
+                                    final String ffn=dispName; final String fline=line;
                                     SwingUtilities.invokeLater(new Runnable(){public void run(){
                                         searchResultData.add(new String[]{ffn,fline,fline,"","http"});
                                         searchModel.addRow(new Object[]{"  "+ffn,"  \uD83C\uDF10 "+fline,have?"Already have":"HTTP"});
@@ -873,6 +1034,7 @@ public class AntMeentoGui {
             setSearchSt(row,"Downloaded"); log("Downloaded: "+fname+" ("+humanSize(len)+")",C_OK);
             final File df=dest; final String rh=host; final int rport=rp;
             pool.submit(new Runnable(){public void run(){String sp=fetchRemotePubKey(rh,rport);createAndPublishBlock(df,sp,"");refreshFiles();}});
+            notifyInfoEndpoints(dest, host);
         }catch(Exception e){new File(DOWNLOAD_DIR,fname).delete();setSearchSt(row,"Error: "+e.getMessage());log("Error: "+e.getMessage(),C_ERR);}
     }
 
@@ -882,7 +1044,7 @@ public class AntMeentoGui {
     //  UI CONSTRUCTION
     // -------------------------------------------------------------------------
     private void buildUI(){
-        frame=new JFrame("Ant Meento GUI  v4.0  —  DHT · PKI · Blockchain · P2P");
+        frame=new JFrame("Ant Meento GUI  v4.2  —  UPnP · DHT · PKI · Blockchain · P2P");
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         frame.setSize(1220,800); frame.setMinimumSize(new Dimension(1000,620));
         frame.setLocationRelativeTo(null); frame.getContentPane().setBackground(C_BG);
@@ -1015,7 +1177,7 @@ public class AntMeentoGui {
         p.add(darkScroll(serversTable),BorderLayout.CENTER);
         // Legend
         JPanel legend=new JPanel(new FlowLayout(FlowLayout.LEFT,14,4)); legend.setBackground(C_PANEL); legend.setBorder(new MatteBorder(1,0,0,0,C_BORDER));
-        addLegend(legend,"  P2P peer",C_TEXT); addLegend(legend,"  HTTP file URL",C_HTTP); addLegend(legend,"  DHT peer-list URL",C_CHAIN);
+        addLegend(legend,"  P2P peer",C_TEXT); addLegend(legend,"  DHT peer-list URL",C_CHAIN); addLegend(legend,"  HTTP file URLs hidden (searchable via SEARCH tab)",C_MUTED);
         p.add(legend,BorderLayout.SOUTH);
         return p;
     }
@@ -1099,8 +1261,8 @@ public class AntMeentoGui {
         final JDialog d=new JDialog(frame,"Add Entries",true);d.setSize(520,320);d.setLocationRelativeTo(frame);d.getContentPane().setBackground(C_PANEL);d.setLayout(new BorderLayout(10,10));
         JPanel topPanel=new JPanel(new BorderLayout()); topPanel.setOpaque(false);
         JLabel l=new JLabel("  Enter entries (one per line):"); l.setFont(new Font("Monospaced",Font.BOLD,12)); l.setForeground(C_ACCENT); l.setBorder(new EmptyBorder(10,0,2,0)); topPanel.add(l,BorderLayout.NORTH);
-        JLabel hint=new JLabel("  • host:52525  (P2P peer)   • https://host:52525/path  (P2P via URL)   • https://host/file.jpg  (HTTP file)   • https://host/servers.txt  (peer list)");
-        hint.setFont(new Font("Monospaced",Font.PLAIN,9)); hint.setForeground(C_MUTED); topPanel.add(hint,BorderLayout.SOUTH);
+        JLabel hint=new JLabel("  • host.com:52525  (P2P peer)   • https://host:52525/path  (P2P via URL)   • https://host/file.jpg  (HTTP file)   • https://host/list.txt  (peer list)   — plain text / HTML rejected");
+        hint.setFont(new Font("Monospaced",Font.PLAIN,9)); hint.setForeground(C_WARN); topPanel.add(hint,BorderLayout.SOUTH);
         d.add(topPanel,BorderLayout.NORTH);
         final JTextArea a=new JTextArea();a.setBackground(C_CARD);a.setForeground(C_TEXT);a.setCaretColor(C_ACCENT);a.setFont(new Font("Monospaced",Font.PLAIN,12));a.setBorder(new EmptyBorder(6,8,6,8));
         JScrollPane sp=darkScroll(a);sp.setBorder(new LineBorder(C_BORDER));d.add(sp,BorderLayout.CENTER);
@@ -1108,8 +1270,25 @@ public class AntMeentoGui {
         JButton cn=makeButton("CANCEL",C_MUTED);cn.addActionListener(new ActionListener(){public void actionPerformed(ActionEvent e){d.dispose();}});
         JButton sv=makeButton("SAVE",C_ACCENT2);sv.addActionListener(new ActionListener(){public void actionPerformed(ActionEvent e){
             String[]lines=a.getText().split("\n");Set<String> ex=loadServers();int added=0;
-            for(String line:lines){line=line.trim();if(!line.isEmpty()&&ex.add(line)){added++;dhtEntries.add(line);}}
-            saveServers(ex);log("Added "+added+" entr(y/ies). Total: "+ex.size(),C_OK);refreshServers();d.dispose();}});
+            List<String> rejected=new ArrayList<String>();
+            for(String line:lines){
+                line=line.trim(); if(line.isEmpty()) continue;
+                if(!isValidEntry(line)){ rejected.add(line); continue; }
+                if(ex.add(line)){added++;dhtEntries.add(line);}
+            }
+            saveServers(ex);
+            if(!rejected.isEmpty()){
+                log("Rejected "+rejected.size()+" invalid entr(y/ies): "+rejected,C_ERR);
+                JOptionPane.showMessageDialog(d,
+                    "The following entries were rejected (invalid format):\n\n"
+                    +String.join("\n",rejected)
+                    +"\n\nAccepted formats:\n"
+                    +"  host.com:52525\n  192.168.1.5:52525\n"
+                    +"  https://example.com/servers.txt\n  https://host:52525/path\n  https://site.com/file.jpg",
+                    "Invalid Entries",JOptionPane.WARNING_MESSAGE);
+            }
+            log("Added "+added+" entr(y/ies). Total: "+ex.size(),C_OK);
+            refreshServers(); d.dispose();}});
         bt.add(cn);bt.add(sv);d.add(bt,BorderLayout.SOUTH);d.setVisible(true);
     }
     private void removeSelectedServer(){
@@ -1123,15 +1302,266 @@ public class AntMeentoGui {
         setStatus("Files: "+ns.size()+"  |  Chain: "+chain.size()+" blocks  |  DHT: "+dhtEntries.size()+" entries  |  Port "+port);}});
     }
     private void refreshServers(){
-        // Show both local servers AND dht runtime entries
+        // Show local servers AND dht runtime entries, but EXCLUDE pure HTTP file URLs
+        // (those are used for sync/search but should not clutter the peers list)
         final Set<String> all=new LinkedHashSet<String>(loadServers());
         all.addAll(dhtEntries);
-        SwingUtilities.invokeLater(new Runnable(){public void run(){serversModel.setRowCount(0);for(String s:all)serversModel.addRow(new Object[]{"  "+s});}});
+        SwingUtilities.invokeLater(new Runnable(){public void run(){
+            serversModel.setRowCount(0);
+            for(String s:all){
+                // Hide direct HTTP file entries — they are not peers
+                if(isHttpFileUrl(s) && !isHttpWithP2PPort(s)) continue;
+                serversModel.addRow(new Object[]{"  "+s});
+            }
+        }});
     }
     private void log(final String msg, final Color color){SwingUtilities.invokeLater(new Runnable(){public void run(){try{javax.swing.text.StyledDocument doc=logPane.getStyledDocument();javax.swing.text.Style st=logPane.addStyle("s",null);javax.swing.text.StyleConstants.setForeground(st,C_MUTED);javax.swing.text.StyleConstants.setFontFamily(st,"Monospaced");javax.swing.text.StyleConstants.setFontSize(st,10);String ts=new SimpleDateFormat("HH:mm:ss").format(new Date());doc.insertString(doc.getLength(),"["+ts+"] ",st);javax.swing.text.StyleConstants.setForeground(st,color);javax.swing.text.StyleConstants.setFontSize(st,11);doc.insertString(doc.getLength(),msg+"\n",st);logPane.setCaretPosition(doc.getLength());}catch(Exception ig){}}});}
     private void setStatus(final String msg){SwingUtilities.invokeLater(new Runnable(){public void run(){statusLabel.setText("  "+msg);}});}
     private void setSyncRunning(final boolean r){SwingUtilities.invokeLater(new Runnable(){public void run(){syncBtn.setEnabled(!r);syncProgress.setVisible(r);syncProgress.setIndeterminate(r);}});}
     private void doExit(){int r=JOptionPane.showConfirmDialog(frame,"Shut down Ant Meento GUI?","Exit",JOptionPane.YES_NO_OPTION,JOptionPane.QUESTION_MESSAGE);if(r==JOptionPane.YES_OPTION){pool.shutdownNow();try{if(serverSock!=null)serverSock.close();}catch(IOException ig){}System.exit(0);}}
+
+    // -------------------------------------------------------------------------
+    //  UPNP / NAT-PMP — pure Java, no external libraries
+    //
+    //  Flow:
+    //   1. Send UDP SSDP M-SEARCH multicast to 239.255.255.250:1900
+    //      looking for urn:schemas-upnp-org:device:InternetGatewayDevice:1
+    //   2. Parse the LOCATION header from the first valid reply
+    //   3. HTTP GET the device description XML at that location
+    //   4. Extract the <controlURL> of the WANIPConnection or WANPPPConnection service
+    //   5. HTTP POST a SOAP AddPortMapping action to the control URL
+    //   6. HTTP POST GetExternalIPAddress to retrieve and log the external IP
+    //
+    //  On success:  upnpMapped=true, upnpExternalIp set, port badge turns green+IP
+    //  On failure:  logs reason at MUTED level, silently ignored (user still works via manual forwarding)
+    // -------------------------------------------------------------------------
+
+    private void doUPnP(){
+        log("UPnP: discovering gateway...", C_MUTED);
+        try{
+            String location = ssdpDiscover(3000);
+            if(location == null){ log("UPnP: no IGD found on local network.", C_MUTED); return; }
+            log("UPnP: IGD found at "+location, C_MUTED);
+
+            String controlUrl = fetchIgdControlUrl(location);
+            if(controlUrl == null){ log("UPnP: could not parse IGD control URL.", C_MUTED); return; }
+
+            // Store for later use (e.g. lease renewal)
+            upnpIgdUrl = controlUrl;
+
+            // Determine local (LAN) IP to use in the mapping
+            String localIp = getLocalIp();
+            if(localIp == null){ log("UPnP: could not determine local IP.", C_MUTED); return; }
+
+            // Add the port mapping
+            boolean mapped = upnpAddPortMapping(controlUrl, localIp, port);
+            if(!mapped){ log("UPnP: AddPortMapping failed.", C_WARN); return; }
+            upnpMapped = true;
+            log("UPnP: port "+port+" mapped successfully ("+localIp+" ? WAN:"+port+")", C_OK);
+
+            // Get external IP
+            String extIp = upnpGetExternalIp(controlUrl);
+            if(extIp != null){
+                upnpExternalIp = extIp;
+                log("UPnP: external IP = "+extIp, C_OK);
+                // Update port badge to show external IP
+                SwingUtilities.invokeLater(new Runnable(){public void run(){
+                    portLabel.setText("\u25CF  :"+port+"  ["+extIp+"]");
+                    portLabel.setForeground(C_OK);
+                }});
+                setStatus("Port "+port+"  |  External: "+extIp+"  |  ID: "+myFingerprint);
+            }
+        }catch(Exception e){
+            log("UPnP: error — "+e.getMessage(), C_MUTED);
+        }
+    }
+
+    /**
+     * Send SSDP M-SEARCH UDP multicast and return the LOCATION URL of the first
+     * InternetGatewayDevice that replies, or null if none reply within timeoutMs.
+     */
+    private String ssdpDiscover(int timeoutMs) throws Exception{
+        String SSDP_ADDR = "239.255.255.250";
+        int    SSDP_PORT = 1900;
+
+        String msg =
+            "M-SEARCH * HTTP/1.1\r\n"
+            +"HOST: 239.255.255.250:1900\r\n"
+            +"MAN: \"ssdp:discover\"\r\n"
+            +"MX: 2\r\n"
+            +"ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"
+            +"\r\n";
+
+        byte[] bytes = msg.getBytes(StandardCharsets.UTF_8);
+        DatagramSocket udp = new DatagramSocket();
+        udp.setSoTimeout(timeoutMs);
+        InetAddress group = InetAddress.getByName(SSDP_ADDR);
+
+        // Send twice for reliability
+        DatagramPacket send = new DatagramPacket(bytes, bytes.length, group, SSDP_PORT);
+        udp.send(send);
+        udp.send(send);
+
+        byte[] buf = new byte[2048];
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while(System.currentTimeMillis() < deadline){
+            try{
+                DatagramPacket recv = new DatagramPacket(buf, buf.length);
+                udp.receive(recv);
+                String response = new String(recv.getData(), 0, recv.getLength(), StandardCharsets.UTF_8);
+                // Look for LOCATION header (case-insensitive)
+                for(String line : response.split("\r\n")){
+                    if(line.toLowerCase().startsWith("location:")){
+                        String loc = line.substring(9).trim();
+                        udp.close();
+                        return loc;
+                    }
+                }
+            }catch(java.net.SocketTimeoutException ste){ break; }
+        }
+        udp.close();
+        return null;
+    }
+
+    /**
+     * HTTP GET the IGD device description XML and extract the controlURL of the
+     * WANIPConnection or WANPPPConnection service.
+     */
+    private String fetchIgdControlUrl(String location) throws Exception{
+        URL url = new URL(location);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(4000); conn.setReadTimeout(6000);
+        conn.setRequestMethod("GET");
+        if(conn.getResponseCode() < 200 || conn.getResponseCode() >= 300){
+            conn.disconnect(); return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+        String line;
+        while((line=br.readLine())!=null) sb.append(line).append("\n");
+        br.close(); conn.disconnect();
+        String xml = sb.toString();
+
+        // Find the WANIPConnection or WANPPPConnection service block
+        String controlUrl = null;
+        String[] serviceTypes = {
+            "urn:schemas-upnp-org:service:WANIPConnection:1",
+            "urn:schemas-upnp-org:service:WANIPConnection:2",
+            "urn:schemas-upnp-org:service:WANPPPConnection:1"
+        };
+        for(String svcType : serviceTypes){
+            int svcIdx = xml.indexOf(svcType);
+            if(svcIdx < 0) continue;
+            // Find the <controlURL> tag after the serviceType
+            int ctrlIdx = xml.indexOf("<controlURL>", svcIdx);
+            if(ctrlIdx < 0) continue;
+            int ctrlEnd = xml.indexOf("</controlURL>", ctrlIdx);
+            if(ctrlEnd < 0) continue;
+            controlUrl = xml.substring(ctrlIdx + "<controlURL>".length(), ctrlEnd).trim();
+            break;
+        }
+        if(controlUrl == null) return null;
+
+        // Make it absolute if it's a relative path
+        if(controlUrl.startsWith("/")){
+            controlUrl = url.getProtocol()+"://"+url.getHost()+":"+url.getPort()+controlUrl;
+        }
+        return controlUrl;
+    }
+
+    /**
+     * SOAP AddPortMapping action — maps WAN port ? LAN localIp:port.
+     * Returns true if the router accepted the mapping (HTTP 200).
+     */
+    private boolean upnpAddPortMapping(String controlUrl, String localIp, int mappingPort) throws Exception{
+        String soap =
+            "<?xml version=\"1.0\"?>\r\n"
+            +"<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+            +"s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+            +"<s:Body>\r\n"
+            +"<u:AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">\r\n"
+            +"<NewRemoteHost></NewRemoteHost>\r\n"
+            +"<NewExternalPort>"+mappingPort+"</NewExternalPort>\r\n"
+            +"<NewProtocol>TCP</NewProtocol>\r\n"
+            +"<NewInternalPort>"+mappingPort+"</NewInternalPort>\r\n"
+            +"<NewInternalClient>"+localIp+"</NewInternalClient>\r\n"
+            +"<NewEnabled>1</NewEnabled>\r\n"
+            +"<NewPortMappingDescription>AntMeentoGUI</NewPortMappingDescription>\r\n"
+            +"<NewLeaseDuration>86400</NewLeaseDuration>\r\n"
+            +"</u:AddPortMapping>\r\n"
+            +"</s:Body>\r\n"
+            +"</s:Envelope>\r\n";
+
+        return soapPost(controlUrl,
+            "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping", soap) != null;
+    }
+
+    /**
+     * SOAP GetExternalIPAddress — returns the WAN IP as a String, or null on failure.
+     */
+    private String upnpGetExternalIp(String controlUrl) throws Exception{
+        String soap =
+            "<?xml version=\"1.0\"?>\r\n"
+            +"<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+            +"s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+            +"<s:Body>\r\n"
+            +"<u:GetExternalIPAddress xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">"
+            +"</u:GetExternalIPAddress>\r\n"
+            +"</s:Body>\r\n"
+            +"</s:Envelope>\r\n";
+
+        String response = soapPost(controlUrl,
+            "urn:schemas-upnp-org:service:WANIPConnection:1#GetExternalIPAddress", soap);
+        if(response == null) return null;
+        // Parse <NewExternalIPAddress>...</NewExternalIPAddress>
+        String tag = "<NewExternalIPAddress>";
+        int idx = response.indexOf(tag);
+        if(idx < 0) return null;
+        int end = response.indexOf("<", idx + tag.length());
+        if(end < 0) return null;
+        return response.substring(idx + tag.length(), end).trim();
+    }
+
+    /**
+     * HTTP POST a SOAP request and return the response body, or null if HTTP != 200.
+     */
+    private String soapPost(String controlUrl, String soapAction, String body) throws Exception{
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+        URL url = new URL(controlUrl);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(5000); conn.setReadTimeout(8000);
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
+        conn.setRequestProperty("Content-Length", String.valueOf(bodyBytes.length));
+        conn.setRequestProperty("SOAPAction", "\""+soapAction+"\"");
+        conn.setRequestProperty("Connection", "Close");
+        conn.getOutputStream().write(bodyBytes);
+        conn.getOutputStream().flush();
+        int code = conn.getResponseCode();
+        InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+        if(is == null){ conn.disconnect(); return code >= 200 && code < 300 ? "" : null; }
+        StringBuilder sb = new StringBuilder();
+        BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+        String line;
+        while((line=br.readLine())!=null) sb.append(line).append("\n");
+        br.close(); conn.disconnect();
+        return (code >= 200 && code < 300) ? sb.toString() : null;
+    }
+
+    /**
+     * Get the local LAN IP address (the one that routes toward the internet,
+     * not loopback).  Uses a UDP connect trick — no packet is actually sent.
+     */
+    private String getLocalIp(){
+        try{
+            DatagramSocket s = new DatagramSocket();
+            s.connect(InetAddress.getByName("8.8.8.8"), 80);
+            String ip = s.getLocalAddress().getHostAddress();
+            s.close();
+            return ip;
+        }catch(Exception e){ return null; }
+    }
 
     // -------------------------------------------------------------------------
     //  UTILITIES
